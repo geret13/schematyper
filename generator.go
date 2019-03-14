@@ -57,6 +57,30 @@ func (s structFields) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
+type goEnum struct {
+	Name   string
+	Values []string
+}
+
+func (ge goEnum) print(buf *bytes.Buffer) {
+	buf.WriteString(fmt.Sprintf("type %s string\n\n", ge.Name))
+
+	rep := strings.NewReplacer(
+		".", "_",
+		"-", "",
+	)
+
+	buf.WriteString("const(\n")
+	for i, v := range ge.Values {
+		if i == 0 {
+			buf.WriteString(fmt.Sprintf("%s_%s %s = \"%s\"\n", ge.Name, rep.Replace(v), ge.Name, v))
+		} else {
+			buf.WriteString(fmt.Sprintf("%s_%s = \"%s\"\n", ge.Name, rep.Replace(v), v))
+		}
+	}
+	buf.WriteString(")\n")
+}
+
 type goType struct {
 	Name       string
 	TypeRef    string
@@ -129,6 +153,20 @@ func (t goTypes) Swap(i, j int) {
 	t[i], t[j] = t[j], t[i]
 }
 
+type goEnums []goEnum
+
+func (t goEnums) Len() int {
+	return len(t)
+}
+
+func (t goEnums) Less(i, j int) bool {
+	return t[i].Name < t[j].Name
+}
+
+func (t goEnums) Swap(i, j int) {
+	t[i], t[j] = t[j], t[i]
+}
+
 var needTimeImport bool
 
 const (
@@ -159,10 +197,14 @@ var typeStrings = map[string]string{
 	typeArray:   typeArray,
 }
 
-func getTypeString(jsonType, format string) string {
-	if format == "date-time" {
+func getTypeString(jsonType, propName string, schema *metaSchema) string {
+	if schema.Format == "date-time" {
 		needTimeImport = true
 		return typeTime
+	}
+
+	if len(schema.Enum) > 0 {
+		return propName
 	}
 
 	if ts, ok := typeStrings[jsonType]; ok {
@@ -335,6 +377,7 @@ func (m stringSetMap) has(set string) bool {
 }
 
 var types = make(map[string]goType)
+var enums = make(map[string]goEnum)
 var deferredTypes = make(map[string]deferredType)
 var typesByName = make(stringSetMap)
 var transitiveRefs = make(map[string]string)
@@ -437,7 +480,7 @@ func processType(s *metaSchema, pName, pDesc, path, parentPath string) (typeRef 
 	hasProps := len(props) > 0
 	hasAddlProps, addlPropsSchema := parseAdditionalProperties(s.AdditionalProperties)
 
-	ts := getTypeString(jsonType, s.Format)
+	ts := getTypeString(jsonType, "NOPROPNAME", s)
 	switch ts {
 	case typeObject:
 		if gt.Name == "Properties" {
@@ -529,10 +572,10 @@ func processType(s *metaSchema, pName, pDesc, path, parentPath string) (typeRef 
 					jsonType = propType[1]
 				}
 
-				sf.TypePrefix = getTypeString(jsonType.(string), propSchema.Format)
+				sf.TypePrefix = getTypeString(jsonType.(string), sf.Name, propSchema)
 			}
 		case string:
-			sf.TypePrefix = getTypeString(propType, propSchema.Format)
+			sf.TypePrefix = getTypeString(propType, sf.Name, propSchema)
 		case nil:
 			sf.TypePrefix = typeEmptyInterface
 		}
@@ -594,6 +637,23 @@ func processType(s *metaSchema, pName, pDesc, path, parentPath string) (typeRef 
 			default:
 				sf.TypePrefix = typeEmptyInterfaceSlice
 			}
+		}
+
+		if len(propSchema.Enum) > 0 {
+			enum := goEnum{
+				Name: sf.Name,
+			}
+
+			for _, ev := range propSchema.Enum {
+				st, ok := ev.(string)
+				if !ok {
+					continue
+				}
+
+				enum.Values = append(enum.Values, st)
+			}
+
+			enums[sf.Name] = enum
 		}
 
 		gt.Fields = append(gt.Fields, sf)
@@ -731,6 +791,17 @@ func main() {
 	if needTimeImport {
 		resultSrc.WriteString("import \"time\"\n")
 	}
+
+	enumSlice := make(goEnums, 0, len(enums))
+	for _, gt := range enums {
+		enumSlice = append(enumSlice, gt)
+	}
+	sort.Stable(enumSlice)
+	for _, gt := range enumSlice {
+		gt.print(&resultSrc)
+		resultSrc.WriteString("\n")
+	}
+
 	typesSlice := make(goTypes, 0, len(types))
 	for _, gt := range types {
 		typesSlice = append(typesSlice, gt)
@@ -740,6 +811,7 @@ func main() {
 		gt.print(&resultSrc)
 		resultSrc.WriteString("\n")
 	}
+
 	formattedSrc, err := format.Source(resultSrc.Bytes())
 	if err != nil {
 		fmt.Println(resultSrc.String())
